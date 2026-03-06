@@ -502,337 +502,920 @@ static size_t _wcslen(const char *s, size_t maxlen) {
 }
 #endif
 
+
 /* ======================================================================== */
-/* 核心解析模块: print_core                                                 */
-/* 设计目标：与 FILE 无关，纯数据流驱动，便于功能安全认证和复用             */
+/* 格式化输出助手函数区域 (解耦的格式化逻辑)                                 */
 /* ======================================================================== */
 
 /* 定义通用的输出回调接口 */
 typedef int (*out_fct_t)(void *ctx, unsigned c);
 
-/*
- * 解析引擎核心
- * ctx:    输出上下文(如 FILE*, 或者是自建的 buffer struct)
- * out_fn: 字符输出回调函数
- */
-static int print_core(void *ctx, out_fct_t out_fn, const CHAR *fmt,
-                      va_list ap_orig) {
-  unsigned c; /* 存放从格式化字符串中读取的字符 */
-  uint16_t flags;
+/* 助手函数专用的输出宏，自动处理字符累计并检测 I/O 错误 */
+#define HELPER_PUTC(ch) \
+    do { \
+        if (out_fn(ctx, (ch)) < 0) return -1; \
+        chars_written++; \
+    } while (0)
+
+
+/* ---- 1. 处理单个字符 (%c) ---- */
+static int print_char(void *ctx, out_fct_t out_fn, uint16_t flags, int width, va_list *ap_ptr) {
+    int chars_written = 0;
+    (void)flags;
+    (void)width;
+#ifdef _NEED_IO_SHRINK
+    HELPER_PUTC(va_arg(*ap_ptr, int));
+#else
+    size_t size = 1;
+#ifdef _NEED_IO_WCHAR
+    wchar_t wc = 0;
+#ifdef _NEED_IO_WIDETOMB
+    char mb[MB_LEN_MAX];
+    int mb_len = 0;
+#endif
+    if (flags & FL_LONG) {
+        wc = (wchar_t)va_arg(*ap_ptr, wint_t);
+#ifdef _NEED_IO_WIDETOMB
+        mbstate_t ps = { 0 };
+        mb_len = __WCTOMB(mb, wc, &ps);
+        size = (mb_len > 0) ? mb_len : 0;
+#endif
+    }
+#endif
+
+    if (!(flags & FL_LPAD)) {
+        while ((size_t)width > size) { HELPER_PUTC(' '); width--; }
+    }
+
+#ifdef _NEED_IO_WCHAR
+    if (flags & FL_LONG) {
+#ifdef _NEED_IO_WIDETOMB
+        for (int i = 0; i < mb_len; i++) HELPER_PUTC(mb[i]);
+#else
+        HELPER_PUTC((unsigned)wc);
+#endif
+    } else
+#endif
+    {
+        HELPER_PUTC((unsigned)(char)va_arg(*ap_ptr, int));
+    }
+
+    if (flags & FL_LPAD) {
+        while ((size_t)width > size) { HELPER_PUTC(' '); width--; }
+    }
+#endif
+    return chars_written;
+}
+
+
+/* ---- 2. 处理字符串 (%s) ---- */
+static int print_str(void *ctx, out_fct_t out_fn, uint16_t flags, int width, int prec, va_list *ap_ptr, const char **msg) {
+    int chars_written = 0;
+    (void)flags;
+    (void)width;
+    (void)prec;
+    (void)msg;
+#ifdef _NEED_IO_SHRINK
+    const char *pnt = va_arg(*ap_ptr, char *);
+    if (!pnt) pnt = "(null)";
+    char c;
+    while ((c = *pnt++)) HELPER_PUTC(c);
+#else
+    size_t size;
+    const char *pnt = NULL;
+#ifdef _NEED_IO_WCHAR
+    wchar_t *wstr = NULL;
+    if (flags & FL_LONG) {
+        wstr = va_arg(*ap_ptr, wchar_t *);
+        if (!wstr) {
+#ifdef VFPRINTF_S
+            if (msg) *msg = "arg corresponding to '%s' is null";
+            return -2;
+#endif
+            pnt = "(null)";
+            wstr = NULL;
+            goto handle_narrow;
+        }
+        size = (flags & FL_PREC) ? (size_t)prec : SIZE_MAX;
+#ifdef _NEED_IO_WIDETOMB
+        size = _mbslen(wstr, size);
+        if (size == (size_t)-1) return -1;
+#else
+        size = wcsnlen(wstr, size);
+#endif
+    } else
+#endif
+    {
+        pnt = va_arg(*ap_ptr, char *);
+#ifdef _NEED_IO_WCHAR
+    handle_narrow:
+#endif
+        if (!pnt) {
+#ifdef VFPRINTF_S
+            if (msg) *msg = "arg corresponding to '%s' is null";
+            return -2;
+#endif
+            pnt = "(null)";
+        }
+        size = (flags & FL_PREC) ? (size_t)prec : SIZE_MAX;
+#ifdef _NEED_IO_MBTOWIDE
+        size = _wcslen(pnt, size);
+#else
+        size = strnlen(pnt, size);
+#endif
+    }
+
+    if (!(flags & FL_LPAD)) {
+        while ((size_t)width > size) { HELPER_PUTC(' '); width--; }
+    }
+    width -= size;
+
+#ifdef _NEED_IO_WCHAR
+    if (wstr) {
+#ifdef _NEED_IO_WIDETOMB
+        mbstate_t ps = { 0 };
+        while (size) {
+            wchar_t wc = *wstr++;
+            char m[MB_LEN_MAX];
+            int mb_len = __WCTOMB(m, wc, &ps);
+            int i = 0;
+            while (size && mb_len) {
+                HELPER_PUTC(m[i++]);
+                size--; mb_len--;
+            }
+        }
+#else
+        while (size--) HELPER_PUTC(*wstr++);
+#endif
+    } else
+#endif
+    {
+#ifdef _NEED_IO_MBTOWIDE
+        mbstate_t ps = { 0 };
+        while (size--) {
+            wchar_t wc;
+            size_t mb_len = mbrtowc(&wc, pnt, MB_LEN_MAX, &ps);
+            HELPER_PUTC(wc);
+            pnt += mb_len;
+        }
+#else
+        while (size--) HELPER_PUTC(*pnt++);
+#endif
+    }
+
+    if (flags & FL_LPAD) {
+        while (width > 0) { HELPER_PUTC(' '); width--; }
+    }
+#endif
+    return chars_written;
+}
+
+
+/* ---- 3. 处理写入长度 (%n) ---- */
+#if defined(__IO_PERCENT_N) || defined(VFPRINTF_S)
+static int print_n(uint16_t flags, int stream_len, va_list *ap_ptr, const char **msg) {
+    (void)flags;
+    (void)stream_len;
+    (void)msg;
+#ifdef VFPRINTF_S
+    if (msg) *msg = "format string contains percent-n";
+    return -2;
+#else
+    if (flags & FL_LONG) {
+        if (flags & FL_REPD_TYPE)
+            *va_arg(*ap_ptr, long long *) = stream_len;
+        else
+            *va_arg(*ap_ptr, long *) = stream_len;
+    } else if (flags & FL_SHORT) {
+        if (flags & FL_REPD_TYPE)
+            *va_arg(*ap_ptr, signed char *) = stream_len;
+        else
+            *va_arg(*ap_ptr, short *) = stream_len;
+    } else {
+        *va_arg(*ap_ptr, int *) = stream_len;
+    }
+    return 0; /* %n 不会向缓冲区输出任何字符 */
+#endif
+}
+#endif
+
+
+/* ---- 4. 处理整数/进制输出 (%d, %i, %u, %x, %p 等) ---- */
+static int print_int(void *ctx, out_fct_t out_fn, unsigned c, uint16_t flags, int width, int prec, va_list *ap_ptr) {
+    int chars_written = 0;
+    char buf[PRINTF_BUF_SIZE];
+    int buf_len;
+    (void)width;
+    (void)prec;
+
+    if (c == 'd' || c == 'i') {
+        ultoa_signed_t x_s;
+        arg_to_signed(*ap_ptr, flags, x_s);
+
+        if (x_s < 0) {
+            /* Use unsigned in case x_s is the largest negative value */
+            x_s = (ultoa_signed_t) - (ultoa_unsigned_t)x_s;
+            flags |= FL_NEGATIVE;
+        }
+        flags &= ~FL_ALT;
+
+#ifndef _NEED_IO_SHRINK
+        if (x_s == 0 && (flags & FL_PREC) && prec == 0)
+            buf_len = 0;
+        else
+#endif
+            buf_len = __ultoa_invert(x_s, buf, 10) - buf;
+    } else {
+        int base;
+        ultoa_unsigned_t x;
+
+        if (c == 'u') {
+            flags &= ~FL_ALT;
+            base = 10;
+        } else if (c == 'o') {
+            base = 8;
+            c = '\0';
+        } else if (c == 'p') {
+            base = 16;
+            flags |= FL_ALT;
+            c = 'x';
+            if (sizeof(void *) > sizeof(int))
+                flags |= FL_LONG;
+        } else if (TOLOWER(c) == 'x') {
+            base = ('x' - c) | 16;
+#ifdef _NEED_IO_PERCENT_B
+        } else if (TOLOWER(c) == 'b') {
+            base = 2;
+#endif
+        } else {
+            HELPER_PUTC('%');
+            HELPER_PUTC(c);
+            return chars_written;
+        }
+
+        flags &= ~(FL_PLUS | FL_SPACE);
+        arg_to_unsigned(*ap_ptr, flags, x);
+
+        /* Zero gets no special alternate treatment */
+        if (x == 0)
+            flags &= ~FL_ALT;
+
+#ifndef _NEED_IO_SHRINK
+        if (x == 0 && (flags & FL_PREC) && prec == 0)
+            buf_len = 0;
+        else
+#endif
+            buf_len = __ultoa_invert(x, buf, base) - buf;
+    }
+
+#ifndef _NEED_IO_SHRINK
+    int len = buf_len;
+
+    /* Specified precision */
+    if (flags & FL_PREC) {
+        /* Zfill ignored when precision specified */
+        flags &= ~FL_ZFILL;
+        /* If the number is shorter than the precision, pad on the left with zeros */
+        if (len < prec) {
+            len = prec;
+            /* Don't add the leading '0' for alternate octal mode */
+            if (c == '\0')
+                flags &= ~FL_ALT;
+        }
+    }
+
+    /* Alternate mode for octal/hex */
+    if (flags & FL_ALT) {
+        len += 1;
+        if (c != '\0')
+            len += 1;
+    } else if (flags & (FL_NEGATIVE | FL_PLUS | FL_SPACE)) {
+        len += 1;
+    }
+
+    /* Pad on the left ? */
+    if (!(flags & FL_LPAD)) {
+        /* Pad with zeros, using the same loop as the precision modifier */
+        if (flags & FL_ZFILL) {
+            prec = buf_len;
+            if (len < width) {
+                prec += width - len;
+                len = width;
+            }
+        }
+        while (len < width) {
+            HELPER_PUTC(' ');
+            len++;
+        }
+    }
+    width -= len;
+
+    /* Output leading characters */
+    if (flags & FL_ALT) {
+        HELPER_PUTC('0');
+        if (c != '\0')
+            HELPER_PUTC(c);
+    } else if (flags & (FL_NEGATIVE | FL_PLUS | FL_SPACE)) {
+        unsigned char z = ' ';
+        if (flags & FL_PLUS)
+            z = '+';
+        if (flags & FL_NEGATIVE)
+            z = '-';
+        HELPER_PUTC(z);
+    }
+
+    /* Output leading zeros */
+    while (prec > buf_len) {
+        HELPER_PUTC('0');
+        prec--;
+    }
+#else
+    if (flags & FL_ALT) {
+        HELPER_PUTC('0');
+        if (c != '\0')
+            HELPER_PUTC(c);
+    } else if (flags & FL_NEGATIVE)
+        HELPER_PUTC('-');
+#endif
+
+    /* Output value */
+    while (buf_len)
+        HELPER_PUTC(buf[--buf_len]);
+
+    /* Handle right trailing padding */
+    if (flags & FL_LPAD) {
+        while (width > 0) { HELPER_PUTC(' '); width--; }
+    }
+
+    return chars_written;
+}
+
+
+/* ---- 5. 处理浮点数输出 (%f, %e, %g 等) ---- */
+#if IO_VARIANT_IS_FLOAT(PRINTF_VARIANT)
+#define TOCASE(c) ((c) - case_convert)
+static int print_float(void *ctx, out_fct_t out_fn, unsigned c, uint16_t flags, int width, int prec, va_list *ap_ptr) {
+    int chars_written = 0;
+    struct dtoa dtoa;
+    uint8_t       sign;
+    uint8_t       ndigs;
+    unsigned char case_convert;
+    int           exp;
+    int           n;
+    uint8_t       ndigs_exp;
+
+    /* deal with upper vs lower case */
+    case_convert = TOLOWER(c) - c;
+    c = TOLOWER(c);
+
+#ifdef _NEED_IO_LONG_DOUBLE
+    if ((flags & (FL_LONG | FL_REPD_TYPE)) == (FL_LONG | FL_REPD_TYPE)) {
+        PRINTF_LONG_DOUBLE_TYPE fval;
+        fval = PRINTF_LONG_DOUBLE_ARG(*ap_ptr);
+
+        ndigs = 0;
+
+#ifdef _NEED_IO_C99_FORMATS
+        if (c == 'a') {
+            c = 'p';
+            flags |= FL_FLTEXP | FL_FLTHEX;
+
+            if (!(flags & FL_PREC))
+                prec = -1;
+            prec = __lfloat_x_engine(fval, &dtoa, prec, case_convert);
+            ndigs = prec + 1;
+            exp = dtoa.exp;
+            ndigs_exp = 1;
+        } else
+#endif /* _NEED_IO_C99_FORMATS */
+        {
+            int  ndecimal = 0; /* digits after decimal (for 'f' format) */
+            bool fmode = false;
+
+            if (!(flags & FL_PREC))
+                prec = 6;
+            if (c == 'e') {
+                ndigs = prec + 1;
+                flags |= FL_FLTEXP;
+            } else if (c == 'f') {
+                ndigs = LONG_FLOAT_MAX_DIG;
+                ndecimal = prec;
+                flags |= FL_FLTFIX;
+                fmode = true;
+            } else {
+                c += 'e' - 'g';
+                ndigs = prec;
+                if (ndigs < 1)
+                    ndigs = 1;
+            }
+
+            if (ndigs > LONG_FLOAT_MAX_DIG)
+                ndigs = LONG_FLOAT_MAX_DIG;
+
+            ndigs = __lfloat_d_engine(fval, &dtoa, ndigs, fmode, ndecimal);
+            exp = dtoa.exp;
+            ndigs_exp = 2;
+        }
+    } else
+#endif
+    {
+        FLOAT_UINT fval; /* value to print */
+        fval = PRINTF_FLOAT_ARG(*ap_ptr);
+
+        ndigs = 0;
+
+#ifdef _NEED_IO_C99_FORMATS
+        if (c == 'a') {
+            c = 'p';
+            flags |= FL_FLTEXP | FL_FLTHEX;
+
+            if (!(flags & FL_PREC))
+                prec = -1;
+
+            ndigs = 1 + __float_x_engine(fval, &dtoa, prec, case_convert);
+            if (prec <= ndigs)
+                prec = ndigs - 1;
+            exp = dtoa.exp;
+            ndigs_exp = 1;
+        } else
+#endif /* _NEED_IO_C99_FORMATS */
+        {
+            int  ndecimal = 0; /* digits after decimal (for 'f' format) */
+            bool fmode = false;
+
+            if (!(flags & FL_PREC))
+                prec = 6;
+            if (c == 'e') {
+                ndigs = prec + 1;
+                flags |= FL_FLTEXP;
+            } else if (c == 'f') {
+                ndigs = FLOAT_MAX_DIG;
+                ndecimal = prec;
+                flags |= FL_FLTFIX;
+                fmode = true;
+            } else {
+                c += 'e' - 'g';
+                ndigs = prec;
+                if (ndigs < 1)
+                    ndigs = 1;
+            }
+
+            if (ndigs > FLOAT_MAX_DIG)
+                ndigs = FLOAT_MAX_DIG;
+
+            ndigs = __float_d_engine(fval, &dtoa, ndigs, fmode, ndecimal);
+            exp = dtoa.exp;
+            ndigs_exp = 2;
+        }
+    }
+
+    if (exp < -9 || 9 < exp) ndigs_exp = 2;
+    if (exp < -99 || 99 < exp) ndigs_exp = 3;
+#ifdef _NEED_IO_FLOAT64
+    if (exp < -999 || 999 < exp) ndigs_exp = 4;
+#ifdef _NEED_IO_FLOAT_LARGE
+    if (exp < -9999 || 9999 < exp) ndigs_exp = 5;
+#endif
+#endif
+
+    sign = 0;
+    if (dtoa.flags & DTOA_MINUS) sign = '-';
+    else if (flags & FL_PLUS)    sign = '+';
+    else if (flags & FL_SPACE)   sign = ' ';
+
+    if (dtoa.flags & (DTOA_NAN | DTOA_INF)) {
+        ndigs = sign ? 4 : 3;
+        if (width > ndigs) {
+            width -= ndigs;
+            if (!(flags & FL_LPAD)) {
+                do { HELPER_PUTC(' '); } while (--width);
+            }
+        } else {
+            width = 0;
+        }
+        if (sign) HELPER_PUTC(sign);
+
+        const char *pnt = "inf";
+        if (dtoa.flags & DTOA_NAN) pnt = "nan";
+        while ((c = *pnt++)) HELPER_PUTC(TOCASE(c));
+    } else {
+
+        if (!(flags & (FL_FLTEXP | FL_FLTFIX))) {
+            if (prec == 0) prec = 1;
+            while (ndigs > 0 && dtoa.digits[ndigs - 1] == '0') ndigs--;
+
+            int req_prec = prec;
+            if (!(flags & FL_ALT)) prec = ndigs;
+
+            if (-4 <= exp && exp < req_prec) {
+                flags |= FL_FLTFIX;
+                if (exp < prec) prec = prec - (exp + 1);
+                else prec = 0;
+            } else {
+                prec = prec - 1;
+            }
+        }
+
+        if (flags & FL_FLTFIX)
+            n = (exp > 0 ? exp + 1 : 1);
+        else {
+            n = 3; /* 1e+ */
+#ifdef _NEED_IO_C99_FORMATS
+            if (flags & FL_FLTHEX) n += 2; /* or 0x1p+ */
+#endif
+            n += ndigs_exp; /* add exponent */
+        }
+        if (sign) n += 1;
+        if (prec) n += prec + 1;
+        else if (flags & FL_ALT) n += 1;
+
+        width = width > n ? width - n : 0;
+
+        if (!(flags & (FL_LPAD | FL_ZFILL))) {
+            while (width) { HELPER_PUTC(' '); width--; }
+        }
+        if (sign) HELPER_PUTC(sign);
+
+#ifdef _NEED_IO_C99_FORMATS
+        if ((flags & FL_FLTHEX)) {
+            HELPER_PUTC('0');
+            HELPER_PUTC(TOCASE('x'));
+        }
+#endif
+
+        if (!(flags & FL_LPAD)) {
+            while (width) { HELPER_PUTC('0'); width--; }
+        }
+
+        if (flags & FL_FLTFIX) {
+            char out;
+            n = exp > 0 ? exp : 0;
+            do {
+                if (n == -1) HELPER_PUTC('.');
+                if (0 <= exp - n && exp - n < ndigs) out = dtoa.digits[exp - n];
+                else out = '0';
+                if (--n < -prec) break;
+                HELPER_PUTC(out);
+            } while (1);
+            HELPER_PUTC(out);
+            if ((flags & FL_ALT) && n == -1) HELPER_PUTC('.');
+        } else {
+            HELPER_PUTC(dtoa.digits[0]);
+            if (prec > 0) {
+                HELPER_PUTC('.');
+                int pos = 1;
+                for (pos = 1; pos < 1 + prec; pos++)
+                    HELPER_PUTC(pos < ndigs ? dtoa.digits[pos] : '0');
+            } else if (flags & FL_ALT)
+                HELPER_PUTC('.');
+
+            HELPER_PUTC(TOCASE(c));
+            sign = '+';
+            if (exp < 0) { exp = -exp; sign = '-'; }
+            HELPER_PUTC(sign);
+#ifdef _NEED_IO_FLOAT_LARGE
+            if (ndigs_exp > 4) { HELPER_PUTC(exp / 10000 + '0'); exp %= 10000; }
+#endif
+#ifdef _NEED_IO_FLOAT64
+            if (ndigs_exp > 3) { HELPER_PUTC(exp / 1000 + '0'); exp %= 1000; }
+#endif
+            if (ndigs_exp > 2) { HELPER_PUTC(exp / 100 + '0'); exp %= 100; }
+            if (ndigs_exp > 1) { HELPER_PUTC(exp / 10 + '0'); exp %= 10; }
+            HELPER_PUTC('0' + exp);
+        }
+    }
+
+    if (flags & FL_LPAD) {
+        while (width > 0) { HELPER_PUTC(' '); width--; }
+    }
+
+    return chars_written;
+}
+#undef TOCASE
+#else
+/* 浮点数未开启时的 Fallback 代理函数 */
+static int print_float_fallback(void *ctx, out_fct_t out_fn, uint16_t flags, int width, va_list *ap_ptr) {
+    int chars_written = 0;
+    (void)flags;
+    (void)width;
+    SKIP_FLOAT_ARG(flags, *ap_ptr);
+    const char *pnt = "*float*";
+    size_t size = 7; /* sizeof("*float*") - 1 */
+
+    if (!(flags & FL_LPAD)) {
+        while ((size_t)width > size) { HELPER_PUTC(' '); width--; }
+    }
+    for (size_t i = 0; i < size; i++) HELPER_PUTC(pnt[i]);
+    if (flags & FL_LPAD) {
+        while ((size_t)width > size) { HELPER_PUTC(' '); width--; }
+    }
+    return chars_written;
+}
+#endif
+
+
+/* ======================================================================== */
+/* 核心解析模块: print_core                                                 */
+/* ======================================================================== */
+
+static int
+print_core(void *ctx, out_fct_t out_fn, const CHAR *fmt, va_list ap_orig)
+{
+    unsigned c; /* 存放从格式化字符串中读取的字符 */
+    uint16_t flags;
 
 #ifdef VFPRINTF_S
-  /* 补全安全模式下，子文件报告违规抛错所依赖的变量 */
-  const char *msg;
+    const char *msg = NULL;
 #endif
 
 #ifdef _NEED_IO_POS_ARGS
-  int argno;
-  my_va_list my_ap;
-  const CHAR *fmt_orig = fmt;
+    int         argno;
+    my_va_list  my_ap;
+    const CHAR *fmt_orig = fmt;
 #define ap my_ap.ap
 #else
 #define ap ap_orig
 #endif
 
-  /* u 联合体，外部被引用的子文件 (vfprintf_*.c) 会重度依赖它 */
-  union {
-    char buf[PRINTF_BUF_SIZE];
-#ifdef _NEED_IO_WCHAR
-    wchar_t wbuf[PRINTF_BUF_SIZE / 2];
-#endif
-#ifdef _NEED_IO_WIDETOMB
-    char mb[MB_LEN_MAX];
-#endif
-#if IO_VARIANT_IS_FLOAT(PRINTF_VARIANT)
-    struct dtoa dtoa;
-#endif
-  } u;
+    int stream_len = 0;
 
-  const char *pnt;
-#ifndef _NEED_IO_SHRINK
-  size_t size;
-#endif
-
-  int stream_len = 0;
-
-  /* * 关键魔法宏：
-   * 原代码中子模块均调用 my_putc(c, stream)
-   * 这里我们强行将其拦截，并导向到 out_fn(ctx, c)。
-   * 宏的第二个参数被故意丢弃，使得底层完全不依赖 stream。
-   */
+    /* `my_putc` 仅在 print_core 外层的格式控制符之前使用 */
 #undef my_putc
-#define my_putc(char_val, ignored_stream_arg)                                  \
-  do {                                                                         \
-    ++stream_len;                                                              \
-    if (out_fn(ctx, (char_val)) < 0)                                           \
-      goto fail;                                                               \
-  } while (0)
+#define my_putc(char_val, ignored)              \
+    do {                                        \
+        ++stream_len;                           \
+        if (out_fn(ctx, (char_val)) < 0)        \
+            goto fail;                          \
+    } while (0)
 
 #ifdef _NEED_IO_POS_ARGS
-  va_copy(ap, ap_orig);
+    va_copy(ap, ap_orig);
 #endif
-
-  /* 主解析循环 */
-  for (;;) {
 
     for (;;) {
-      c = *fmt++;
-      if (!c)
-        goto ret;
-      if (c == '%') {
-        c = *fmt++;
-        if (c != '%')
-          break;
-      }
-      /* 0 仅仅是为了占位，满足原 my_putc 的参数个数要求，实际被宏忽略 */
-      my_putc(c, 0);
-    }
+        for (;;) {
+            c = *fmt++;
+            if (!c) goto ret;
+            if (c == '%') {
+                c = *fmt++;
+                if (c != '%') break;
+            }
+            my_putc(c, 0);
+        }
 
-    flags = 0;
+        flags = 0;
+        int width = 0;
+        int prec = 0;
+        (void)width;
+        (void)prec;
+#ifdef _NEED_IO_POS_ARGS
+        argno = 0;
+#endif
+
+        do {
+            if (flags < FL_WIDTH) {
+                switch (c) {
+                case '0': flags |= FL_ZFILL; continue;
+                case '+': flags |= FL_PLUS;  __fallthrough;
+                case ' ': flags |= FL_SPACE; continue;
+                case '-': flags |= FL_LPAD;  continue;
+                case '#': flags |= FL_ALT;   continue;
+                case '\'': continue;
+                }
+            }
+
+            if (flags < FL_LONG) {
+                if (c >= '0' && c <= '9') {
 #ifndef _NEED_IO_SHRINK
-    int width = 0;
-    int prec = 0;
+                    c -= '0';
+                    if (flags & FL_PREC) prec = 10 * prec + c;
+                    else { width = 10 * width + c; flags |= FL_WIDTH; }
 #endif
+                    continue;
+                }
+                if (c == '*') {
 #ifdef _NEED_IO_POS_ARGS
-    argno = 0;
+                    if (argno) continue;
 #endif
-
-    do {
-      if (flags < FL_WIDTH) {
-        switch (c) {
-        case '0':
-          flags |= FL_ZFILL;
-          continue;
-        case '+':
-          flags |= FL_PLUS;
-          __fallthrough;
-        case ' ':
-          flags |= FL_SPACE;
-          continue;
-        case '-':
-          flags |= FL_LPAD;
-          continue;
-        case '#':
-          flags |= FL_ALT;
-          continue;
-        case '\'':
-          continue;
-        }
-      }
-
-      if (flags < FL_LONG) {
-        if (c >= '0' && c <= '9') {
-#ifndef _NEED_IO_SHRINK
-          c -= '0';
-          if (flags & FL_PREC) {
-            prec = 10 * prec + c;
-          } else {
-            width = 10 * width + c;
-            flags |= FL_WIDTH;
-          }
-#endif
-          continue;
-        }
-        if (c == '*') {
-#ifdef _NEED_IO_POS_ARGS
-          if (argno)
-            continue;
-#endif
-          if (flags & FL_PREC) {
+                    if (flags & FL_PREC) {
 #ifdef _NEED_IO_SHRINK
-            (void)va_arg(ap, int);
+                        (void)va_arg(ap, int);
 #else
-            prec = va_arg(ap, int);
+                        prec = va_arg(ap, int);
 #endif
-          } else {
+                    } else {
 #ifdef _NEED_IO_SHRINK
-            (void)va_arg(ap, int);
+                        (void)va_arg(ap, int);
 #else
-            width = va_arg(ap, int);
+                        width = va_arg(ap, int);
+                        flags |= FL_WIDTH;
 #endif
-            flags |= FL_WIDTH;
-          }
-          continue;
-        }
-        if (c == '.') {
-          if (flags & FL_PREC)
-            goto ret;
-          flags |= FL_PREC;
-          continue;
-        }
+                    }
+                    continue;
+                }
+                if (c == '.') {
+                    if (flags & FL_PREC) goto ret;
+                    flags |= FL_PREC;
+                    continue;
+                }
 #ifdef _NEED_IO_POS_ARGS
-        if (c == '$') {
-          if (argno) {
+                if (c == '$') {
+                    if (argno) {
+                        va_end(ap);
+                        va_copy(ap, ap_orig);
+                        skip_to_arg(fmt_orig, &my_ap, (flags & FL_PREC) ? prec : width);
+                        if (flags & FL_PREC) prec = va_arg(ap, int);
+                        else width = va_arg(ap, int);
+                    } else {
+                        argno = width;
+                        flags = 0;
+                        width = 0;
+                        prec = 0;
+                    }
+                    continue;
+                }
+#endif
+            }
+            CHECK_INT_SIZES(c, flags);
+            break;
+        } while ((c = *fmt++) != 0);
+
+#ifdef _NEED_IO_POS_ARGS
+        if (argno) {
             va_end(ap);
             va_copy(ap, ap_orig);
-            skip_to_arg(fmt_orig, &my_ap, (flags & FL_PREC) ? prec : width);
-            if (flags & FL_PREC)
-              prec = va_arg(ap, int);
-            else
-              width = va_arg(ap, int);
-          } else {
-            argno = width;
-            flags = 0;
-            width = 0;
-            prec = 0;
-          }
-          continue;
+            skip_to_arg(fmt_orig, &my_ap, argno);
         }
 #endif
-      }
-
-      CHECK_INT_SIZES(c, flags);
-      break;
-    } while ((c = *fmt++) != 0);
-
-#ifdef _NEED_IO_POS_ARGS
-    if (argno) {
-      va_end(ap);
-      va_copy(ap, ap_orig);
-      skip_to_arg(fmt_orig, &my_ap, argno);
-    }
-#endif
 
 #ifndef _NEED_IO_SHRINK
-    if (prec < 0) {
-      prec = 0;
-      flags &= ~FL_PREC;
-    }
-    if (width < 0) {
-      width = -width;
-      flags |= FL_LPAD;
-    }
+        if (prec < 0) { prec = 0; flags &= ~FL_PREC; }
+        if (width < 0) { width = -width; flags |= FL_LPAD; }
 #endif
 
-#define TOCASE(c) ((c) - case_convert)
+        int helper_res = 0;
 
 #ifndef _NEED_IO_SHRINK
-    if ((TOLOWER(c) >= 'e' && TOLOWER(c) <= 'g')
+        if ((TOLOWER(c) >= 'e' && TOLOWER(c) <= 'g')
 #ifdef _NEED_IO_C99_FORMATS
-        || TOLOWER(c) == 'a'
+            || TOLOWER(c) == 'a'
 #endif
-    ) {
+        ) {
 #if IO_VARIANT_IS_FLOAT(PRINTF_VARIANT)
-#include "vfprintf_float.c"
+            helper_res = print_float(ctx, out_fn, c, flags, width, prec, &ap);
 #else
-      SKIP_FLOAT_ARG(flags, ap);
-      pnt = "*float*";
-      size = sizeof("*float*") - 1;
-      goto str_lpad;
+            helper_res = print_float_fallback(ctx, out_fn, flags, width, &ap);
 #endif
-    } else
+        } else
 #endif
-    {
-      int buf_len;
-#ifdef _NEED_IO_WCHAR
-      wchar_t *wstr = NULL;
-      pnt = NULL;
+        {
+            if (c == 'c') {
+                helper_res = print_char(ctx, out_fn, flags, width, &ap);
+            } else if (c == 's') {
+#ifdef VFPRINTF_S
+                helper_res = print_str(ctx, out_fn, flags, width, prec, &ap, &msg);
+#else
+                helper_res = print_str(ctx, out_fn, flags, width, prec, &ap, NULL);
 #endif
-
-      if (c == 'c') {
-#include "vfprintf_char.c"
-      } else if (c == 's') {
-#include "vfprintf_str.c"
-      }
+            }
 #if defined(__IO_PERCENT_N) || defined(VFPRINTF_S)
-      else if (c == 'n') {
-#include "vfprintf_n.c"
-      }
+            else if (c == 'n') {
+#ifdef VFPRINTF_S
+                helper_res = print_n(flags, stream_len, &ap, &msg);
+#else
+                helper_res = print_n(flags, stream_len, &ap, NULL);
 #endif
-      else {
-#include "vfprintf_int.c"
-      }
-    }
+            }
+#endif
+            else {
+                helper_res = print_int(ctx, out_fn, c, flags, width, prec, &ap);
+            }
+        }
 
-#ifndef _NEED_IO_SHRINK
-    while (width-- > 0) {
-      my_putc(' ', 0);
-    }
+        /* 捕获由切分函数抛回的异常 */
+        if (helper_res < 0) {
+#ifdef VFPRINTF_S
+            if (helper_res == -2) goto handle_error;
 #endif
-  } /* for (;;) */
+            goto fail;
+        }
+
+        stream_len += helper_res;
+    } /* for (;;) */
 
 ret:
 #ifdef _NEED_IO_POS_ARGS
-  va_end(ap);
+    va_end(ap);
 #endif
 #undef my_putc
 #undef ap
-  return stream_len;
+    return stream_len;
 
 fail:
-  stream_len = -1;
-  goto ret;
+    stream_len = -1;
+    goto ret;
 
 #ifdef VFPRINTF_S
-/* 补充内层子文件引发错误时的处理逻辑 */
 handle_error:
-  if (__cur_handler != NULL) {
-    __cur_handler(msg, NULL, -1);
-  }
-  stream_len = -1;
-  goto ret;
+    if (__cur_handler != NULL) {
+        __cur_handler(msg, NULL, -1);
+    }
+    stream_len = -1;
+    goto ret;
 #endif
 }
+
 
 /* ======================================================================== */
 /* 外部包装器: 针对 stdio FILE 流的 vfprintf                                */
 /* ======================================================================== */
 
-/* FILE 输出的专用回调包装 */
-static int stdio_out_wrapper(void *ctx, unsigned c) {
-  FILE *stream = (FILE *)ctx;
+static int stdio_out_wrapper(void *ctx, unsigned c)
+{
+    FILE *stream = (FILE *)ctx;
 #ifdef WIDE_CHARS
-  return (putwc((wchar_t)c, stream) == WEOF) ? -1 : 0;
+    return (putwc((wchar_t)c, stream) == WEOF) ? -1 : 0;
 #else
-  int (*put)(char, FILE *) = stream->put;
-  return put((char)c, stream);
+    int (*put)(char, FILE *) = stream->put;
+    return put((char)c, stream);
 #endif
 }
 
 #ifdef VFPRINTF_S
-int vfprintf_s(FILE *__restrict stream, const char *__restrict fmt,
-               va_list ap_orig)
+int vfprintf_s(FILE * __restrict stream, const char * __restrict fmt, va_list ap_orig)
 #else
 int vfprintf(FILE *stream, const CHAR *fmt, va_list ap_orig)
 #endif
 {
-  int stream_len = 0;
+    int stream_len = 0;
 
 #ifdef VFPRINTF_S
-  const char *msg;
-  if (stream == NULL) {
-    msg = "output stream is null";
-    goto handle_error;
-  } else if (fmt == NULL) {
-    msg = "null format string";
-    goto handle_error;
-  }
+    const char *msg;
+    if (stream == NULL) {
+        msg = "output stream is null";
+        goto handle_error;
+    } else if (fmt == NULL) {
+        msg = "null format string";
+        goto handle_error;
+    }
 #endif
 
-  __flockfile(stream);
+    __flockfile(stream);
 
-  if ((stream->flags & __SWR) == 0)
-    __funlock_return(stream, EOF);
+    if ((stream->flags & __SWR) == 0)
+        __funlock_return(stream, EOF);
 
-  /* 调用纯核心解析器 */
-  stream_len = print_core((void *)stream, stdio_out_wrapper, fmt, ap_orig);
+    stream_len = print_core((void *)stream, stdio_out_wrapper, fmt, ap_orig);
 
-  if (stream_len < 0) {
-    stream->flags |= __SERR;
-  }
+    if (stream_len < 0) {
+        stream->flags |= __SERR;
+    }
 
-  __funlock_return(stream, stream_len);
+    __funlock_return(stream, stream_len);
 
 #ifdef VFPRINTF_S
-/* 处理流或格式字符串为NULL时的最外层异常捕获 */
 handle_error:
-  if (__cur_handler != NULL) {
-    __cur_handler(msg, NULL, -1);
-  }
-  if (stream)
-    stream->flags |= __SERR;
-  return -1;
+    if (__cur_handler != NULL) {
+        __cur_handler(msg, NULL, -1);
+    }
+    if (stream)
+        stream->flags |= __SERR;
+    return -1;
 #endif
+}
+
+
+/* ======================================================================== */
+/* 附加功能：基于 print_core 实现的无锁内存安全 vsnprintf                 */
+/* ======================================================================== */
+
+typedef struct {
+    char *buf;
+    size_t max_len;
+    size_t count;
+} snprintf_ctx_t;
+
+static int string_out_wrapper(void *ctx_ptr, unsigned c)
+{
+    snprintf_ctx_t *ctx = (snprintf_ctx_t *)ctx_ptr;
+    if (ctx->max_len > 0 && ctx->count < (ctx->max_len - 1)) {
+        ctx->buf[ctx->count] = (char)c;
+    }
+    ctx->count++;
+    return 0;
+}
+
+int vsnprintf(char *str, size_t size, const char *fmt, va_list ap)
+{
+    snprintf_ctx_t ctx = { str, size, 0 };
+    print_core(&ctx, string_out_wrapper, fmt, ap);
+
+    if (size > 0) {
+        if (ctx.count < size) str[ctx.count] = '\0';
+        else str[size - 1] = '\0';
+    }
+
+    return (int)ctx.count;
 }
 
 #if !defined(VFPRINTF_S) && !defined(WIDE_CHARS)
@@ -841,8 +1424,9 @@ handle_error:
 #ifdef __strong_reference
 __strong_reference(vfprintf, PRINTF_NAME);
 #else
-int PRINTF_NAME(FILE *stream, const char *fmt, va_list ap) {
-  return vfprintf(stream, fmt, ap);
+int PRINTF_NAME(FILE *stream, const char *fmt, va_list ap)
+{
+    return vfprintf(stream, fmt, ap);
 }
 #endif
 #endif
