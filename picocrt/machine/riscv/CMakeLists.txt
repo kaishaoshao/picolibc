@@ -33,15 +33,12 @@
 # OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-add_library(semihost STATIC)
+add_library(picocrt OBJECT crt0.c)
+add_library(picocrt-semihost OBJECT crt0.c)
 
-target_compile_options(semihost PRIVATE ${PICOLIBC_COMPILE_OPTIONS})
+target_compile_options(picocrt PRIVATE ${PICOLIBC_COMPILE_OPTIONS})
+target_compile_options(picocrt-semihost PRIVATE -DCRT0_EXIT -DCRT0_SEMIHOST ${PICOLIBC_COMPILE_OPTIONS})
 
-target_include_directories(semihost SYSTEM PUBLIC ${PICOLIBC_INCLUDE_DIRECTORIES})
-
-add_subdirectory(machine/${CMAKE_SYSTEM_PROCESSOR})
-
-# if(DEFINED _SEMIHOST_ARM)
-  add_subdirectory(common)
-# endif()
+target_include_directories(picocrt SYSTEM PUBLIC ${PICOLIBC_INCLUDE_DIRECTORIES})
+target_include_directories(picocrt-semihost SYSTEM PUBLIC ${PICOLIBC_INCLUDE_DIRECTORIES})
 

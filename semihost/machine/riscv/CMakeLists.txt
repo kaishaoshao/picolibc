@@ -1,7 +1,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 #
-# Copyright © 2022 Keith Packard
+# Copyright © 2021 Keith Packard
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -33,15 +33,6 @@
 # OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-add_library(semihost STATIC)
-
-target_compile_options(semihost PRIVATE ${PICOLIBC_COMPILE_OPTIONS})
-
-target_include_directories(semihost SYSTEM PUBLIC ${PICOLIBC_INCLUDE_DIRECTORIES})
-
-add_subdirectory(machine/${CMAKE_SYSTEM_PROCESSOR})
-
-# if(DEFINED _SEMIHOST_ARM)
-  add_subdirectory(common)
-# endif()
-
+target_sources(semihost PRIVATE
+semihost-riscv.S
+  )

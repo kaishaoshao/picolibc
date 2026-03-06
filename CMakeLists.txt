@@ -46,15 +46,15 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES AND NOT DEFINED ZEPHYR
       STRING "Choose the type of build." FORCE)
 endif()
 
-if(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "arm64")
+if(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "arm6")
   set(CMAKE_SYSTEM_PROCESSOR "aarch64")
 endif()
 
 set(CMAKE_SYSTEM_SUB_PROCESSOR ${CMAKE_SYSTEM_PROCESSOR})
 
 if(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "i686" OR
-    ${CMAKE_SYSTEM_PROCESSOR} STREQUAL "x86_64") 
-  set(CMAKE_SYSTEM_PROCESSOR "x86")
+    ${CMAKE_SYSTEM_PROCESSOR} STREQUAL "x86_64")
+  set(CMAKE_SYSTEM_PROCESSOR "riscv")
 endif()
 
 if(ZEPHYR_BASE)
@@ -354,19 +354,21 @@ define_property(GLOBAL PROPERTY PICOLIBC_HEADERS
 
 add_subdirectory(libc)
 add_subdirectory(libm)
+add_subdirectory(semihost)
+add_subdirectory(picocrt)
 
-install(TARGETS c
+install(TARGETS c semihost picocrt
+  RUNTIME DESTINATION bin
   LIBRARY DESTINATION lib
   PUBLIC_HEADER DESTINATION include)
 
-option(TESTS "Enable tests" OFF)
-if(TESTS)
+# option(TESTS "Enable tests" ON)
+# if(TESTS)
 
   # This could use some generalization, but it's good enough to do
   # semihosting-based tests
 
-  add_subdirectory(semihost)
-  add_subdirectory(picocrt)
+
 
   set(PICOCRT_OBJ $<TARGET_OBJECTS:picocrt>)
   set(PICOCRT_SEMIHOST_OBJ $<TARGET_OBJECTS:picocrt-semihost>)
@@ -374,15 +376,15 @@ if(TESTS)
   # semihost and libc have mutual-dependencies, so place them in a
   # linker group
 
-  set(PICOLIBC_TEST_LINK_LIBRARIES
-    ${PICOCRT_SEMIHOST_OBJ}
-    -Wl,--start-group c semihost -Wl,--end-group
-    ${PICOLIBC_LINK_FLAGS}
-    )
+  # set(PICOLIBC_TEST_LINK_LIBRARIES
+  #   ${PICOCRT_SEMIHOST_OBJ}
+  #   -Wl,--start-group c semihost -Wl,--end-group
+  #   ${PICOLIBC_LINK_FLAGS}
+  #   )
 
-  add_subdirectory(test)
+#   # add_subdirectory(test)
 
-endif()
+# endif()
 
 install(FILES ${CMAKE_BINARY_DIR}/picolibc.specs DESTINATION lib)
 install(FILES ${CMAKE_BINARY_DIR}/picolibc/include/picolibc.h DESTINATION include)
