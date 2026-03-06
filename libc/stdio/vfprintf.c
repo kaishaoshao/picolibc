@@ -504,28 +504,104 @@ static size_t _wcslen(const char *s, size_t maxlen) {
 
 
 /* ======================================================================== */
-/* 格式化输出助手函数区域 (解耦的格式化逻辑)                                 */
+/* 现代格式化核心引擎架构 (上下文与路由设计)                                */
 /* ======================================================================== */
 
 /* 定义通用的输出回调接口 */
 typedef int (*out_fct_t)(void *ctx, unsigned c);
 
-/* 助手函数专用的输出宏，自动处理字符累计并检测 I/O 错误 */
+/* 1. 统一的格式化状态上下文 */
+typedef struct {
+    void *ctx;              /* 输出目标上下文 */
+    out_fct_t out_fn;       /* 底层字符输出回调 */
+    int stream_len;         /* 当前已输出的总字符数 */
+    const char *error_msg;  /* 用于安全模式的异常信息记录 */
+} print_state_t;
+
+/* 助手函数输出宏：自动累计字符数，并在失败时引发中断 */
 #define HELPER_PUTC(ch) \
     do { \
-        if (out_fn(ctx, (ch)) < 0) return -1; \
+        if (state->out_fn(state->ctx, (ch)) < 0) return -1; \
         chars_written++; \
     } while (0)
 
 
-/* ---- 1. 处理单个字符 (%c) ---- */
-static int print_char(void *ctx, out_fct_t out_fn, uint16_t flags, int width, va_list *ap_ptr) {
+/* ======================================================================== */
+/* 【模块分离】极简版处理器 (Shrink Mode) - 纯粹的内核逻辑，无视填充和精度  */
+/* ======================================================================== */
+
+static int print_char_shrink(print_state_t *state, unsigned c, uint16_t flags, int width, int prec, va_list *ap_ptr) {
     int chars_written = 0;
-    (void)flags;
-    (void)width;
-#ifdef _NEED_IO_SHRINK
+    (void)c; (void)flags; (void)width; (void)prec;
     HELPER_PUTC(va_arg(*ap_ptr, int));
-#else
+    return chars_written;
+}
+
+static int print_str_shrink(print_state_t *state, unsigned c, uint16_t flags, int width, int prec, va_list *ap_ptr) {
+    int chars_written = 0;
+    (void)c; (void)flags; (void)width; (void)prec;
+    const char *pnt = va_arg(*ap_ptr, char *);
+    if (!pnt) pnt = "(null)";
+    char ch;
+    while ((ch = *pnt++)) HELPER_PUTC(ch);
+    return chars_written;
+}
+
+static int print_int_shrink(print_state_t *state, unsigned c, uint16_t flags, int width, int prec, va_list *ap_ptr) {
+    int chars_written = 0;
+    char buf[PRINTF_BUF_SIZE];
+    int buf_len;
+    (void)width; (void)prec;
+
+    if (c == 'd' || c == 'i') {
+        ultoa_signed_t x_s;
+        arg_to_signed(*ap_ptr, flags, x_s);
+        if (x_s < 0) {
+            x_s = (ultoa_signed_t) - (ultoa_unsigned_t)x_s;
+            flags |= FL_NEGATIVE;
+        }
+        flags &= ~FL_ALT;
+        buf_len = __ultoa_invert(x_s, buf, 10) - buf;
+    } else {
+        int base;
+        ultoa_unsigned_t x;
+        if (c == 'u') { flags &= ~FL_ALT; base = 10; }
+        else if (c == 'o') { base = 8; c = '\0'; }
+        else if (c == 'p') { base = 16; flags |= FL_ALT; c = 'x'; if (sizeof(void*) > sizeof(int)) flags |= FL_LONG; }
+        else if (TOLOWER(c) == 'x') { base = ('x' - c) | 16; }
+#ifdef _NEED_IO_PERCENT_B
+        else if (TOLOWER(c) == 'b') { base = 2; }
+#endif
+        else {
+            HELPER_PUTC('%'); HELPER_PUTC(c);
+            return chars_written;
+        }
+
+        flags &= ~(FL_PLUS | FL_SPACE);
+        arg_to_unsigned(*ap_ptr, flags, x);
+        if (x == 0) flags &= ~FL_ALT;
+        buf_len = __ultoa_invert(x, buf, base) - buf;
+    }
+
+    if (flags & FL_ALT) {
+        HELPER_PUTC('0');
+        if (c != '\0') HELPER_PUTC(c);
+    } else if (flags & FL_NEGATIVE) {
+        HELPER_PUTC('-');
+    }
+
+    while (buf_len) HELPER_PUTC(buf[--buf_len]);
+    return chars_written;
+}
+
+
+/* ======================================================================== */
+/* 【模块分离】完整版处理器 (Full Mode) - 包含精细的填充、对齐和宽度控制    */
+/* ======================================================================== */
+
+static int print_char_full(print_state_t *state, unsigned c, uint16_t flags, int width, int prec, va_list *ap_ptr) {
+    int chars_written = 0;
+    (void)c; (void)prec;
     size_t size = 1;
 #ifdef _NEED_IO_WCHAR
     wchar_t wc = 0;
@@ -563,24 +639,12 @@ static int print_char(void *ctx, out_fct_t out_fn, uint16_t flags, int width, va
     if (flags & FL_LPAD) {
         while ((size_t)width > size) { HELPER_PUTC(' '); width--; }
     }
-#endif
     return chars_written;
 }
 
-
-/* ---- 2. 处理字符串 (%s) ---- */
-static int print_str(void *ctx, out_fct_t out_fn, uint16_t flags, int width, int prec, va_list *ap_ptr, const char **msg) {
+static int print_str_full(print_state_t *state, unsigned c, uint16_t flags, int width, int prec, va_list *ap_ptr) {
     int chars_written = 0;
-    (void)flags;
-    (void)width;
-    (void)prec;
-    (void)msg;
-#ifdef _NEED_IO_SHRINK
-    const char *pnt = va_arg(*ap_ptr, char *);
-    if (!pnt) pnt = "(null)";
-    char c;
-    while ((c = *pnt++)) HELPER_PUTC(c);
-#else
+    (void)c;
     size_t size;
     const char *pnt = NULL;
 #ifdef _NEED_IO_WCHAR
@@ -589,12 +653,10 @@ static int print_str(void *ctx, out_fct_t out_fn, uint16_t flags, int width, int
         wstr = va_arg(*ap_ptr, wchar_t *);
         if (!wstr) {
 #ifdef VFPRINTF_S
-            if (msg) *msg = "arg corresponding to '%s' is null";
+            state->error_msg = "arg corresponding to '%s' is null";
             return -2;
 #endif
-            pnt = "(null)";
-            wstr = NULL;
-            goto handle_narrow;
+            pnt = "(null)"; wstr = NULL; goto handle_narrow;
         }
         size = (flags & FL_PREC) ? (size_t)prec : SIZE_MAX;
 #ifdef _NEED_IO_WIDETOMB
@@ -612,7 +674,7 @@ static int print_str(void *ctx, out_fct_t out_fn, uint16_t flags, int width, int
 #endif
         if (!pnt) {
 #ifdef VFPRINTF_S
-            if (msg) *msg = "arg corresponding to '%s' is null";
+            state->error_msg = "arg corresponding to '%s' is null";
             return -2;
 #endif
             pnt = "(null)";
@@ -639,10 +701,7 @@ static int print_str(void *ctx, out_fct_t out_fn, uint16_t flags, int width, int
             char m[MB_LEN_MAX];
             int mb_len = __WCTOMB(m, wc, &ps);
             int i = 0;
-            while (size && mb_len) {
-                HELPER_PUTC(m[i++]);
-                size--; mb_len--;
-            }
+            while (size && mb_len) { HELPER_PUTC(m[i++]); size--; mb_len--; }
         }
 #else
         while (size--) HELPER_PUTC(*wstr++);
@@ -653,10 +712,8 @@ static int print_str(void *ctx, out_fct_t out_fn, uint16_t flags, int width, int
 #ifdef _NEED_IO_MBTOWIDE
         mbstate_t ps = { 0 };
         while (size--) {
-            wchar_t wc;
-            size_t mb_len = mbrtowc(&wc, pnt, MB_LEN_MAX, &ps);
-            HELPER_PUTC(wc);
-            pnt += mb_len;
+            wchar_t wc; size_t mb_len = mbrtowc(&wc, pnt, MB_LEN_MAX, &ps);
+            HELPER_PUTC(wc); pnt += mb_len;
         }
 #else
         while (size--) HELPER_PUTC(*pnt++);
@@ -666,306 +723,136 @@ static int print_str(void *ctx, out_fct_t out_fn, uint16_t flags, int width, int
     if (flags & FL_LPAD) {
         while (width > 0) { HELPER_PUTC(' '); width--; }
     }
-#endif
     return chars_written;
 }
 
-
-/* ---- 3. 处理写入长度 (%n) ---- */
-#if defined(__IO_PERCENT_N) || defined(VFPRINTF_S)
-static int print_n(uint16_t flags, int stream_len, va_list *ap_ptr, const char **msg) {
-    (void)flags;
-    (void)stream_len;
-    (void)msg;
-#ifdef VFPRINTF_S
-    if (msg) *msg = "format string contains percent-n";
-    return -2;
-#else
-    if (flags & FL_LONG) {
-        if (flags & FL_REPD_TYPE)
-            *va_arg(*ap_ptr, long long *) = stream_len;
-        else
-            *va_arg(*ap_ptr, long *) = stream_len;
-    } else if (flags & FL_SHORT) {
-        if (flags & FL_REPD_TYPE)
-            *va_arg(*ap_ptr, signed char *) = stream_len;
-        else
-            *va_arg(*ap_ptr, short *) = stream_len;
-    } else {
-        *va_arg(*ap_ptr, int *) = stream_len;
-    }
-    return 0; /* %n 不会向缓冲区输出任何字符 */
-#endif
-}
-#endif
-
-
-/* ---- 4. 处理整数/进制输出 (%d, %i, %u, %x, %p 等) ---- */
-static int print_int(void *ctx, out_fct_t out_fn, unsigned c, uint16_t flags, int width, int prec, va_list *ap_ptr) {
+static int print_int_full(print_state_t *state, unsigned c, uint16_t flags, int width, int prec, va_list *ap_ptr) {
     int chars_written = 0;
     char buf[PRINTF_BUF_SIZE];
     int buf_len;
-    (void)width;
-    (void)prec;
 
     if (c == 'd' || c == 'i') {
         ultoa_signed_t x_s;
         arg_to_signed(*ap_ptr, flags, x_s);
-
-        if (x_s < 0) {
-            /* Use unsigned in case x_s is the largest negative value */
-            x_s = (ultoa_signed_t) - (ultoa_unsigned_t)x_s;
-            flags |= FL_NEGATIVE;
-        }
+        if (x_s < 0) { x_s = (ultoa_signed_t) - (ultoa_unsigned_t)x_s; flags |= FL_NEGATIVE; }
         flags &= ~FL_ALT;
-
-#ifndef _NEED_IO_SHRINK
-        if (x_s == 0 && (flags & FL_PREC) && prec == 0)
-            buf_len = 0;
-        else
-#endif
-            buf_len = __ultoa_invert(x_s, buf, 10) - buf;
+        if (x_s == 0 && (flags & FL_PREC) && prec == 0) buf_len = 0;
+        else buf_len = __ultoa_invert(x_s, buf, 10) - buf;
     } else {
-        int base;
-        ultoa_unsigned_t x;
-
-        if (c == 'u') {
-            flags &= ~FL_ALT;
-            base = 10;
-        } else if (c == 'o') {
-            base = 8;
-            c = '\0';
-        } else if (c == 'p') {
-            base = 16;
-            flags |= FL_ALT;
-            c = 'x';
-            if (sizeof(void *) > sizeof(int))
-                flags |= FL_LONG;
-        } else if (TOLOWER(c) == 'x') {
-            base = ('x' - c) | 16;
+        int base; ultoa_unsigned_t x;
+        if (c == 'u') { flags &= ~FL_ALT; base = 10; }
+        else if (c == 'o') { base = 8; c = '\0'; }
+        else if (c == 'p') { base = 16; flags |= FL_ALT; c = 'x'; if (sizeof(void*) > sizeof(int)) flags |= FL_LONG; }
+        else if (TOLOWER(c) == 'x') { base = ('x' - c) | 16; }
 #ifdef _NEED_IO_PERCENT_B
-        } else if (TOLOWER(c) == 'b') {
-            base = 2;
+        else if (TOLOWER(c) == 'b') { base = 2; }
 #endif
-        } else {
-            HELPER_PUTC('%');
-            HELPER_PUTC(c);
-            return chars_written;
-        }
+        else { HELPER_PUTC('%'); HELPER_PUTC(c); return chars_written; }
 
         flags &= ~(FL_PLUS | FL_SPACE);
         arg_to_unsigned(*ap_ptr, flags, x);
-
-        /* Zero gets no special alternate treatment */
-        if (x == 0)
-            flags &= ~FL_ALT;
-
-#ifndef _NEED_IO_SHRINK
-        if (x == 0 && (flags & FL_PREC) && prec == 0)
-            buf_len = 0;
-        else
-#endif
-            buf_len = __ultoa_invert(x, buf, base) - buf;
+        if (x == 0) flags &= ~FL_ALT;
+        if (x == 0 && (flags & FL_PREC) && prec == 0) buf_len = 0;
+        else buf_len = __ultoa_invert(x, buf, base) - buf;
     }
 
-#ifndef _NEED_IO_SHRINK
     int len = buf_len;
-
-    /* Specified precision */
     if (flags & FL_PREC) {
-        /* Zfill ignored when precision specified */
         flags &= ~FL_ZFILL;
-        /* If the number is shorter than the precision, pad on the left with zeros */
-        if (len < prec) {
-            len = prec;
-            /* Don't add the leading '0' for alternate octal mode */
-            if (c == '\0')
-                flags &= ~FL_ALT;
-        }
+        if (len < prec) { len = prec; if (c == '\0') flags &= ~FL_ALT; }
     }
+    if (flags & FL_ALT) { len += 1; if (c != '\0') len += 1; }
+    else if (flags & (FL_NEGATIVE | FL_PLUS | FL_SPACE)) { len += 1; }
 
-    /* Alternate mode for octal/hex */
-    if (flags & FL_ALT) {
-        len += 1;
-        if (c != '\0')
-            len += 1;
-    } else if (flags & (FL_NEGATIVE | FL_PLUS | FL_SPACE)) {
-        len += 1;
-    }
-
-    /* Pad on the left ? */
     if (!(flags & FL_LPAD)) {
-        /* Pad with zeros, using the same loop as the precision modifier */
         if (flags & FL_ZFILL) {
             prec = buf_len;
-            if (len < width) {
-                prec += width - len;
-                len = width;
-            }
+            if (len < width) { prec += width - len; len = width; }
         }
-        while (len < width) {
-            HELPER_PUTC(' ');
-            len++;
-        }
+        while (len < width) { HELPER_PUTC(' '); len++; }
     }
     width -= len;
 
-    /* Output leading characters */
     if (flags & FL_ALT) {
-        HELPER_PUTC('0');
-        if (c != '\0')
-            HELPER_PUTC(c);
+        HELPER_PUTC('0'); if (c != '\0') HELPER_PUTC(c);
     } else if (flags & (FL_NEGATIVE | FL_PLUS | FL_SPACE)) {
         unsigned char z = ' ';
-        if (flags & FL_PLUS)
-            z = '+';
-        if (flags & FL_NEGATIVE)
-            z = '-';
+        if (flags & FL_PLUS) z = '+';
+        if (flags & FL_NEGATIVE) z = '-';
         HELPER_PUTC(z);
     }
 
-    /* Output leading zeros */
-    while (prec > buf_len) {
-        HELPER_PUTC('0');
-        prec--;
-    }
-#else
-    if (flags & FL_ALT) {
-        HELPER_PUTC('0');
-        if (c != '\0')
-            HELPER_PUTC(c);
-    } else if (flags & FL_NEGATIVE)
-        HELPER_PUTC('-');
-#endif
+    while (prec > buf_len) { HELPER_PUTC('0'); prec--; }
+    while (buf_len) HELPER_PUTC(buf[--buf_len]);
 
-    /* Output value */
-    while (buf_len)
-        HELPER_PUTC(buf[--buf_len]);
-
-    /* Handle right trailing padding */
     if (flags & FL_LPAD) {
         while (width > 0) { HELPER_PUTC(' '); width--; }
     }
-
     return chars_written;
 }
 
 
-/* ---- 5. 处理浮点数输出 (%f, %e, %g 等) ---- */
+/* ======================================================================== */
+/* 浮点数处理器区 (Float Handlers)                                          */
+/* ======================================================================== */
+
 #if IO_VARIANT_IS_FLOAT(PRINTF_VARIANT)
 #define TOCASE(c) ((c) - case_convert)
-static int print_float(void *ctx, out_fct_t out_fn, unsigned c, uint16_t flags, int width, int prec, va_list *ap_ptr) {
+static int print_float_full(print_state_t *state, unsigned c, uint16_t flags, int width, int prec, va_list *ap_ptr) {
     int chars_written = 0;
     struct dtoa dtoa;
-    uint8_t       sign;
-    uint8_t       ndigs;
+    uint8_t sign, ndigs, ndigs_exp;
     unsigned char case_convert;
-    int           exp;
-    int           n;
-    uint8_t       ndigs_exp;
+    int exp, n;
 
-    /* deal with upper vs lower case */
     case_convert = TOLOWER(c) - c;
     c = TOLOWER(c);
 
 #ifdef _NEED_IO_LONG_DOUBLE
     if ((flags & (FL_LONG | FL_REPD_TYPE)) == (FL_LONG | FL_REPD_TYPE)) {
-        PRINTF_LONG_DOUBLE_TYPE fval;
-        fval = PRINTF_LONG_DOUBLE_ARG(*ap_ptr);
-
+        PRINTF_LONG_DOUBLE_TYPE fval = PRINTF_LONG_DOUBLE_ARG(*ap_ptr);
         ndigs = 0;
-
 #ifdef _NEED_IO_C99_FORMATS
         if (c == 'a') {
-            c = 'p';
-            flags |= FL_FLTEXP | FL_FLTHEX;
-
-            if (!(flags & FL_PREC))
-                prec = -1;
+            c = 'p'; flags |= FL_FLTEXP | FL_FLTHEX;
+            if (!(flags & FL_PREC)) prec = -1;
             prec = __lfloat_x_engine(fval, &dtoa, prec, case_convert);
-            ndigs = prec + 1;
-            exp = dtoa.exp;
-            ndigs_exp = 1;
+            ndigs = prec + 1; exp = dtoa.exp; ndigs_exp = 1;
         } else
-#endif /* _NEED_IO_C99_FORMATS */
+#endif
         {
-            int  ndecimal = 0; /* digits after decimal (for 'f' format) */
-            bool fmode = false;
-
-            if (!(flags & FL_PREC))
-                prec = 6;
-            if (c == 'e') {
-                ndigs = prec + 1;
-                flags |= FL_FLTEXP;
-            } else if (c == 'f') {
-                ndigs = LONG_FLOAT_MAX_DIG;
-                ndecimal = prec;
-                flags |= FL_FLTFIX;
-                fmode = true;
-            } else {
-                c += 'e' - 'g';
-                ndigs = prec;
-                if (ndigs < 1)
-                    ndigs = 1;
-            }
-
-            if (ndigs > LONG_FLOAT_MAX_DIG)
-                ndigs = LONG_FLOAT_MAX_DIG;
-
+            int ndecimal = 0; bool fmode = false;
+            if (!(flags & FL_PREC)) prec = 6;
+            if (c == 'e') { ndigs = prec + 1; flags |= FL_FLTEXP; }
+            else if (c == 'f') { ndigs = LONG_FLOAT_MAX_DIG; ndecimal = prec; flags |= FL_FLTFIX; fmode = true; }
+            else { c += 'e' - 'g'; ndigs = prec; if (ndigs < 1) ndigs = 1; }
+            if (ndigs > LONG_FLOAT_MAX_DIG) ndigs = LONG_FLOAT_MAX_DIG;
             ndigs = __lfloat_d_engine(fval, &dtoa, ndigs, fmode, ndecimal);
-            exp = dtoa.exp;
-            ndigs_exp = 2;
+            exp = dtoa.exp; ndigs_exp = 2;
         }
     } else
 #endif
     {
-        FLOAT_UINT fval; /* value to print */
-        fval = PRINTF_FLOAT_ARG(*ap_ptr);
-
+        FLOAT_UINT fval = PRINTF_FLOAT_ARG(*ap_ptr);
         ndigs = 0;
-
 #ifdef _NEED_IO_C99_FORMATS
         if (c == 'a') {
-            c = 'p';
-            flags |= FL_FLTEXP | FL_FLTHEX;
-
-            if (!(flags & FL_PREC))
-                prec = -1;
-
+            c = 'p'; flags |= FL_FLTEXP | FL_FLTHEX;
+            if (!(flags & FL_PREC)) prec = -1;
             ndigs = 1 + __float_x_engine(fval, &dtoa, prec, case_convert);
-            if (prec <= ndigs)
-                prec = ndigs - 1;
-            exp = dtoa.exp;
-            ndigs_exp = 1;
+            if (prec <= ndigs) prec = ndigs - 1;
+            exp = dtoa.exp; ndigs_exp = 1;
         } else
-#endif /* _NEED_IO_C99_FORMATS */
+#endif
         {
-            int  ndecimal = 0; /* digits after decimal (for 'f' format) */
-            bool fmode = false;
-
-            if (!(flags & FL_PREC))
-                prec = 6;
-            if (c == 'e') {
-                ndigs = prec + 1;
-                flags |= FL_FLTEXP;
-            } else if (c == 'f') {
-                ndigs = FLOAT_MAX_DIG;
-                ndecimal = prec;
-                flags |= FL_FLTFIX;
-                fmode = true;
-            } else {
-                c += 'e' - 'g';
-                ndigs = prec;
-                if (ndigs < 1)
-                    ndigs = 1;
-            }
-
-            if (ndigs > FLOAT_MAX_DIG)
-                ndigs = FLOAT_MAX_DIG;
-
+            int ndecimal = 0; bool fmode = false;
+            if (!(flags & FL_PREC)) prec = 6;
+            if (c == 'e') { ndigs = prec + 1; flags |= FL_FLTEXP; }
+            else if (c == 'f') { ndigs = FLOAT_MAX_DIG; ndecimal = prec; flags |= FL_FLTFIX; fmode = true; }
+            else { c += 'e' - 'g'; ndigs = prec; if (ndigs < 1) ndigs = 1; }
+            if (ndigs > FLOAT_MAX_DIG) ndigs = FLOAT_MAX_DIG;
             ndigs = __float_d_engine(fval, &dtoa, ndigs, fmode, ndecimal);
-            exp = dtoa.exp;
-            ndigs_exp = 2;
+            exp = dtoa.exp; ndigs_exp = 2;
         }
     }
 
@@ -987,69 +874,49 @@ static int print_float(void *ctx, out_fct_t out_fn, unsigned c, uint16_t flags, 
         ndigs = sign ? 4 : 3;
         if (width > ndigs) {
             width -= ndigs;
-            if (!(flags & FL_LPAD)) {
-                do { HELPER_PUTC(' '); } while (--width);
-            }
-        } else {
-            width = 0;
-        }
+            if (!(flags & FL_LPAD)) do { HELPER_PUTC(' '); } while (--width);
+        } else width = 0;
         if (sign) HELPER_PUTC(sign);
-
         const char *pnt = "inf";
         if (dtoa.flags & DTOA_NAN) pnt = "nan";
         while ((c = *pnt++)) HELPER_PUTC(TOCASE(c));
     } else {
-
         if (!(flags & (FL_FLTEXP | FL_FLTFIX))) {
             if (prec == 0) prec = 1;
             while (ndigs > 0 && dtoa.digits[ndigs - 1] == '0') ndigs--;
-
             int req_prec = prec;
             if (!(flags & FL_ALT)) prec = ndigs;
-
             if (-4 <= exp && exp < req_prec) {
                 flags |= FL_FLTFIX;
                 if (exp < prec) prec = prec - (exp + 1);
                 else prec = 0;
-            } else {
-                prec = prec - 1;
-            }
+            } else prec = prec - 1;
         }
 
-        if (flags & FL_FLTFIX)
-            n = (exp > 0 ? exp + 1 : 1);
+        if (flags & FL_FLTFIX) n = (exp > 0 ? exp + 1 : 1);
         else {
-            n = 3; /* 1e+ */
+            n = 3;
 #ifdef _NEED_IO_C99_FORMATS
-            if (flags & FL_FLTHEX) n += 2; /* or 0x1p+ */
+            if (flags & FL_FLTHEX) n += 2;
 #endif
-            n += ndigs_exp; /* add exponent */
+            n += ndigs_exp;
         }
         if (sign) n += 1;
         if (prec) n += prec + 1;
         else if (flags & FL_ALT) n += 1;
 
         width = width > n ? width - n : 0;
-
-        if (!(flags & (FL_LPAD | FL_ZFILL))) {
-            while (width) { HELPER_PUTC(' '); width--; }
-        }
+        if (!(flags & (FL_LPAD | FL_ZFILL))) while (width) { HELPER_PUTC(' '); width--; }
         if (sign) HELPER_PUTC(sign);
 
 #ifdef _NEED_IO_C99_FORMATS
-        if ((flags & FL_FLTHEX)) {
-            HELPER_PUTC('0');
-            HELPER_PUTC(TOCASE('x'));
-        }
+        if ((flags & FL_FLTHEX)) { HELPER_PUTC('0'); HELPER_PUTC(TOCASE('x')); }
 #endif
 
-        if (!(flags & FL_LPAD)) {
-            while (width) { HELPER_PUTC('0'); width--; }
-        }
+        if (!(flags & FL_LPAD)) while (width) { HELPER_PUTC('0'); width--; }
 
         if (flags & FL_FLTFIX) {
-            char out;
-            n = exp > 0 ? exp : 0;
+            char out; n = exp > 0 ? exp : 0;
             do {
                 if (n == -1) HELPER_PUTC('.');
                 if (0 <= exp - n && exp - n < ndigs) out = dtoa.digits[exp - n];
@@ -1064,10 +931,8 @@ static int print_float(void *ctx, out_fct_t out_fn, unsigned c, uint16_t flags, 
             if (prec > 0) {
                 HELPER_PUTC('.');
                 int pos = 1;
-                for (pos = 1; pos < 1 + prec; pos++)
-                    HELPER_PUTC(pos < ndigs ? dtoa.digits[pos] : '0');
-            } else if (flags & FL_ALT)
-                HELPER_PUTC('.');
+                for (pos = 1; pos < 1 + prec; pos++) HELPER_PUTC(pos < ndigs ? dtoa.digits[pos] : '0');
+            } else if (flags & FL_ALT) HELPER_PUTC('.');
 
             HELPER_PUTC(TOCASE(c));
             sign = '+';
@@ -1084,68 +949,93 @@ static int print_float(void *ctx, out_fct_t out_fn, unsigned c, uint16_t flags, 
             HELPER_PUTC('0' + exp);
         }
     }
-
-    if (flags & FL_LPAD) {
-        while (width > 0) { HELPER_PUTC(' '); width--; }
-    }
-
+    if (flags & FL_LPAD) while (width > 0) { HELPER_PUTC(' '); width--; }
     return chars_written;
 }
 #undef TOCASE
 #else
-/* 浮点数未开启时的 Fallback 代理函数 */
-static int print_float_fallback(void *ctx, out_fct_t out_fn, uint16_t flags, int width, va_list *ap_ptr) {
+static int print_float_fallback(print_state_t *state, unsigned c, uint16_t flags, int width, int prec, va_list *ap_ptr) {
     int chars_written = 0;
-    (void)flags;
-    (void)width;
+    (void)c; (void)prec;
     SKIP_FLOAT_ARG(flags, *ap_ptr);
     const char *pnt = "*float*";
-    size_t size = 7; /* sizeof("*float*") - 1 */
-
-    if (!(flags & FL_LPAD)) {
-        while ((size_t)width > size) { HELPER_PUTC(' '); width--; }
-    }
+    size_t size = 7;
+    if (!(flags & FL_LPAD)) while ((size_t)width > size) { HELPER_PUTC(' '); width--; }
     for (size_t i = 0; i < size; i++) HELPER_PUTC(pnt[i]);
-    if (flags & FL_LPAD) {
-        while ((size_t)width > size) { HELPER_PUTC(' '); width--; }
-    }
+    if (flags & FL_LPAD) while ((size_t)width > size) { HELPER_PUTC(' '); width--; }
     return chars_written;
 }
 #endif
 
 
 /* ======================================================================== */
-/* 核心解析模块: print_core                                                 */
+/* 杂项处理器区 (%n)                                                        */
 /* ======================================================================== */
 
-static int
-print_core(void *ctx, out_fct_t out_fn, const CHAR *fmt, va_list ap_orig)
-{
-    unsigned c; /* 存放从格式化字符串中读取的字符 */
-    uint16_t flags;
-
+static int print_n_handler(print_state_t *state, unsigned c, uint16_t flags, int width, int prec, va_list *ap_ptr) {
+    (void)c; (void)width; (void)prec;
 #ifdef VFPRINTF_S
-    const char *msg = NULL;
+    state->error_msg = "format string contains percent-n";
+    return -2;
+#else
+    if (flags & FL_LONG) {
+        if (flags & FL_REPD_TYPE) *va_arg(*ap_ptr, long long *) = state->stream_len;
+        else *va_arg(*ap_ptr, long *) = state->stream_len;
+    } else if (flags & FL_SHORT) {
+        if (flags & FL_REPD_TYPE) *va_arg(*ap_ptr, signed char *) = state->stream_len;
+        else *va_arg(*ap_ptr, short *) = state->stream_len;
+    } else {
+        *va_arg(*ap_ptr, int *) = state->stream_len;
+    }
+    return 0;
+#endif
+}
+
+
+/* ======================================================================== */
+/* 核心引擎：宏路由与调度引擎 (Macro Router Engine)                         */
+/* ======================================================================== */
+
+#ifdef _NEED_IO_SHRINK
+    #define HANDLE_CHAR print_char_shrink
+    #define HANDLE_STR  print_str_shrink
+    #define HANDLE_INT  print_int_shrink
+#else
+    #define HANDLE_CHAR print_char_full
+    #define HANDLE_STR  print_str_full
+    #define HANDLE_INT  print_int_full
 #endif
 
+#if IO_VARIANT_IS_FLOAT(PRINTF_VARIANT)
+    #define HANDLE_FLOAT print_float_full
+#else
+    #define HANDLE_FLOAT print_float_fallback
+#endif
+
+#define HANDLE_N print_n_handler
+
+
+/* ======================================================================== */
+/* print_core : 主解析状态机，利用 Switch 提供 O(1) 跳转效率                */
+/* ======================================================================== */
+
+static int print_core(void *ctx, out_fct_t out_fn, const CHAR *fmt, va_list ap_orig)
+{
+    unsigned c;
+    uint16_t flags;
+    print_state_t state = { ctx, out_fn, 0, NULL };
+
 #ifdef _NEED_IO_POS_ARGS
-    int         argno;
-    my_va_list  my_ap;
-    const CHAR *fmt_orig = fmt;
+    int argno; my_va_list my_ap; const CHAR *fmt_orig = fmt;
 #define ap my_ap.ap
 #else
 #define ap ap_orig
 #endif
 
-    int stream_len = 0;
-
-    /* `my_putc` 仅在 print_core 外层的格式控制符之前使用 */
-#undef my_putc
-#define my_putc(char_val, ignored)              \
-    do {                                        \
-        ++stream_len;                           \
-        if (out_fn(ctx, (char_val)) < 0)        \
-            goto fail;                          \
+#define CONSUME_AND_PRINT_CHAR(ch) \
+    do { \
+        if (state.out_fn(state.ctx, (ch)) < 0) goto fail; \
+        state.stream_len++; \
     } while (0)
 
 #ifdef _NEED_IO_POS_ARGS
@@ -1160,14 +1050,12 @@ print_core(void *ctx, out_fct_t out_fn, const CHAR *fmt, va_list ap_orig)
                 c = *fmt++;
                 if (c != '%') break;
             }
-            my_putc(c, 0);
+            CONSUME_AND_PRINT_CHAR(c);
         }
 
         flags = 0;
         int width = 0;
         int prec = 0;
-        (void)width;
-        (void)prec;
 #ifdef _NEED_IO_POS_ARGS
         argno = 0;
 #endif
@@ -1186,38 +1074,19 @@ print_core(void *ctx, out_fct_t out_fn, const CHAR *fmt, va_list ap_orig)
 
             if (flags < FL_LONG) {
                 if (c >= '0' && c <= '9') {
-#ifndef _NEED_IO_SHRINK
-                    c -= '0';
-                    if (flags & FL_PREC) prec = 10 * prec + c;
-                    else { width = 10 * width + c; flags |= FL_WIDTH; }
-#endif
+                    if (flags & FL_PREC) prec = 10 * prec + (c - '0');
+                    else { width = 10 * width + (c - '0'); flags |= FL_WIDTH; }
                     continue;
                 }
                 if (c == '*') {
 #ifdef _NEED_IO_POS_ARGS
                     if (argno) continue;
 #endif
-                    if (flags & FL_PREC) {
-#ifdef _NEED_IO_SHRINK
-                        (void)va_arg(ap, int);
-#else
-                        prec = va_arg(ap, int);
-#endif
-                    } else {
-#ifdef _NEED_IO_SHRINK
-                        (void)va_arg(ap, int);
-#else
-                        width = va_arg(ap, int);
-                        flags |= FL_WIDTH;
-#endif
-                    }
+                    if (flags & FL_PREC) prec = va_arg(ap, int);
+                    else { width = va_arg(ap, int); flags |= FL_WIDTH; }
                     continue;
                 }
-                if (c == '.') {
-                    if (flags & FL_PREC) goto ret;
-                    flags |= FL_PREC;
-                    continue;
-                }
+                if (c == '.') { flags |= FL_PREC; continue; }
 #ifdef _NEED_IO_POS_ARGS
                 if (c == '$') {
                     if (argno) {
@@ -1227,10 +1096,7 @@ print_core(void *ctx, out_fct_t out_fn, const CHAR *fmt, va_list ap_orig)
                         if (flags & FL_PREC) prec = va_arg(ap, int);
                         else width = va_arg(ap, int);
                     } else {
-                        argno = width;
-                        flags = 0;
-                        width = 0;
-                        prec = 0;
+                        argno = width; flags = 0; width = 0; prec = 0;
                     }
                     continue;
                 }
@@ -1248,51 +1114,35 @@ print_core(void *ctx, out_fct_t out_fn, const CHAR *fmt, va_list ap_orig)
         }
 #endif
 
-#ifndef _NEED_IO_SHRINK
         if (prec < 0) { prec = 0; flags &= ~FL_PREC; }
         if (width < 0) { width = -width; flags |= FL_LPAD; }
-#endif
 
         int helper_res = 0;
 
-#ifndef _NEED_IO_SHRINK
-        if ((TOLOWER(c) >= 'e' && TOLOWER(c) <= 'g')
-#ifdef _NEED_IO_C99_FORMATS
-            || TOLOWER(c) == 'a'
-#endif
-        ) {
-#if IO_VARIANT_IS_FLOAT(PRINTF_VARIANT)
-            helper_res = print_float(ctx, out_fn, c, flags, width, prec, &ap);
-#else
-            helper_res = print_float_fallback(ctx, out_fn, flags, width, &ap);
-#endif
-        } else
-#endif
-        {
-            if (c == 'c') {
-                helper_res = print_char(ctx, out_fn, flags, width, &ap);
-            } else if (c == 's') {
-#ifdef VFPRINTF_S
-                helper_res = print_str(ctx, out_fn, flags, width, prec, &ap, &msg);
-#else
-                helper_res = print_str(ctx, out_fn, flags, width, prec, &ap, NULL);
-#endif
-            }
+        switch (c) {
+            case 'c':
+                helper_res = HANDLE_CHAR(&state, c, flags, width, prec, &ap);
+                break;
+            case 's':
+                helper_res = HANDLE_STR(&state, c, flags, width, prec, &ap);
+                break;
+            case 'n':
 #if defined(__IO_PERCENT_N) || defined(VFPRINTF_S)
-            else if (c == 'n') {
-#ifdef VFPRINTF_S
-                helper_res = print_n(flags, stream_len, &ap, &msg);
-#else
-                helper_res = print_n(flags, stream_len, &ap, NULL);
+                helper_res = HANDLE_N(&state, c, flags, width, prec, &ap);
 #endif
-            }
-#endif
-            else {
-                helper_res = print_int(ctx, out_fn, c, flags, width, prec, &ap);
-            }
+                break;
+            case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': case 'p': case 'b':
+                helper_res = HANDLE_INT(&state, c, flags, width, prec, &ap);
+                break;
+            case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A':
+                helper_res = HANDLE_FLOAT(&state, c, flags, width, prec, &ap);
+                break;
+            default:
+                CONSUME_AND_PRINT_CHAR('%');
+                CONSUME_AND_PRINT_CHAR(c);
+                continue;
         }
 
-        /* 捕获由切分函数抛回的异常 */
         if (helper_res < 0) {
 #ifdef VFPRINTF_S
             if (helper_res == -2) goto handle_error;
@@ -1300,28 +1150,25 @@ print_core(void *ctx, out_fct_t out_fn, const CHAR *fmt, va_list ap_orig)
             goto fail;
         }
 
-        stream_len += helper_res;
-    } /* for (;;) */
+        state.stream_len += helper_res;
+    }
 
 ret:
 #ifdef _NEED_IO_POS_ARGS
     va_end(ap);
 #endif
-#undef my_putc
 #undef ap
-    return stream_len;
+    return state.stream_len;
 
 fail:
-    stream_len = -1;
-    goto ret;
+    return -1;
 
 #ifdef VFPRINTF_S
 handle_error:
     if (__cur_handler != NULL) {
-        __cur_handler(msg, NULL, -1);
+        __cur_handler(state.error_msg, NULL, -1);
     }
-    stream_len = -1;
-    goto ret;
+    return -1;
 #endif
 }
 
